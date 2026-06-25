@@ -100,6 +100,7 @@ from agentevac.agents.neighborhood_observation import (
 from agentevac.agents.messaging import AgentMessagingBus, OutboxMessage
 from agentevac.utils.run_parameters import write_run_parameter_log
 from agentevac.utils.replay import RouteReplay
+from agentevac.simulation.observation_export import HomeObservationExporter
 
 # ---- OpenAI (LLM control) ----
 from concurrent.futures import ThreadPoolExecutor
@@ -234,6 +235,15 @@ def _parse_cli_args() -> argparse.Namespace:
         "--params-log-path",
         help="Override PARAMS_LOG_PATH env var (companion run suffix is preserved).",
     )
+    parser.add_argument(
+        "--export-home-observations",
+        help="Write fixed-home per-agent observation timeline JSONL for downstream simulations.",
+    )
+    parser.add_argument(
+        "--export-observation-noise",
+        choices=["on", "off"],
+        help="Enable noisy observed margins in --export-home-observations output.",
+    )
     parser.add_argument("--overlay-max-label-chars", type=int, help="Max overlay label characters.")
     parser.add_argument("--overlay-poi-layer", type=int, help="POI layer for overlays.")
     parser.add_argument("--overlay-poi-offset-m", type=float, help="POI offset in meters.")
@@ -326,6 +336,13 @@ if CLI_ARGS.metrics is not None:
     METRICS_ENABLED = (CLI_ARGS.metrics == "on")
 METRICS_LOG_PATH = CLI_ARGS.metrics_log_path or os.getenv("METRICS_LOG_PATH", "outputs/run_metrics.json")
 PARAMS_LOG_PATH = CLI_ARGS.params_log_path or os.getenv("PARAMS_LOG_PATH", "outputs/run_params.json")
+EXPORT_HOME_OBSERVATIONS_PATH = (
+    CLI_ARGS.export_home_observations
+    or os.getenv("EXPORT_HOME_OBSERVATIONS_PATH")
+)
+EXPORT_OBSERVATION_NOISE = _parse_bool(os.getenv("EXPORT_OBSERVATION_NOISE", "1"), True)
+if CLI_ARGS.export_observation_noise is not None:
+    EXPORT_OBSERVATION_NOISE = (CLI_ARGS.export_observation_noise == "on")
 WEB_DASHBOARD_ENABLED = _parse_bool(os.getenv("WEB_DASHBOARD_ENABLED", "0"), False)
 if CLI_ARGS.web_dashboard is not None:
     WEB_DASHBOARD_ENABLED = (CLI_ARGS.web_dashboard == "on")
@@ -1428,6 +1445,11 @@ def _run_parameter_payload() -> Dict[str, Any]:
                 "lambda_t": LAMBDA_T_SPREAD,
             },
         },
+        "observation_export": {
+            "path": EXPORT_HOME_OBSERVATIONS_PATH,
+            "noise_enabled": EXPORT_OBSERVATION_NOISE,
+            "fixed_current_edge": "home_edge",
+        },
         "departure": {
             "theta_r": DEFAULT_THETA_R,
             "theta_u": DEFAULT_THETA_U,
@@ -1471,6 +1493,15 @@ replay = RouteReplay(RUN_MODE, REPLAY_LOG_PATH)
 events = LiveEventStream(EVENTS_ENABLED, EVENTS_LOG_PATH, EVENTS_STDOUT)
 metrics = RunMetricsCollector(METRICS_ENABLED, METRICS_LOG_PATH, RUN_MODE)
 metrics.total_agents = len(SPAWN_EVENTS)
+home_observation_exporter = HomeObservationExporter(
+    EXPORT_HOME_OBSERVATIONS_PATH,
+    noise_enabled=EXPORT_OBSERVATION_NOISE,
+    map_name=CLI_ARGS.map,
+    net_file=NET_FILE,
+    sigma_info=INFO_SIGMA,
+    distance_ref_m=DIST_REF_M,
+    belief_inertia=BELIEF_INERTIA,
+)
 params_log_path = write_run_parameter_log(
     PARAMS_LOG_PATH,
     _run_parameter_payload(),
@@ -1503,6 +1534,11 @@ if events.path:
     print(f"[EVENTS] enabled={EVENTS_ENABLED} path={events.path} stdout={EVENTS_STDOUT}")
 if metrics.path:
     print(f"[METRICS] enabled={METRICS_ENABLED} path={metrics.path}")
+if home_observation_exporter.enabled:
+    print(
+        f"[HOME_OBSERVATIONS] path={home_observation_exporter.path} "
+        f"noise={'on' if EXPORT_OBSERVATION_NOISE else 'off'}"
+    )
 print(f"[RUN_PARAMS] path={params_log_path}")
 print(
     f"[WEB_DASHBOARD] enabled={dashboard.enabled} host={WEB_DASHBOARD_HOST} "
@@ -1567,7 +1603,15 @@ print(
 vehicle_speed = 0
 total_speed = 0
 
-client = OpenAI()  # uses OPENAI_API_KEY
+_openai_client_instance: Optional[OpenAI] = None
+
+
+def _openai_client() -> OpenAI:
+    """Create the OpenAI client only when an LLM call is actually needed."""
+    global _openai_client_instance
+    if _openai_client_instance is None:
+        _openai_client_instance = OpenAI()  # uses OPENAI_API_KEY
+    return _openai_client_instance
 
 _token_lock = threading.Lock()
 _token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "llm_calls": 0}
@@ -2578,7 +2622,7 @@ def process_pending_departures(step_idx: int):
             else:
                 _ctx["_cached"] = False
                 _ctx["_future"] = _llm_pool.submit(
-                    client.responses.parse,
+                    _openai_client().responses.parse,
                     model=OPENAI_MODEL,
                     input=[
                         {"role": "system", "content": predeparture_system_prompt},
@@ -3139,7 +3183,7 @@ def process_pending_departures(step_idx: int):
             _dep_user_prompt = json.dumps(_dep_env)
 
             _spawn["_dest_future"] = _dest_pool.submit(
-                client.responses.parse,
+                _openai_client().responses.parse,
                 model=OPENAI_MODEL,
                 input=[
                     {"role": "system", "content": _dep_sys_prompt},
@@ -3431,6 +3475,14 @@ def process_vehicles(step_idx: int):
             step_idx=step_idx,
             controlled_count=len(to_control),
         )
+    home_observation_exporter.write_round(
+        tick=step_idx,
+        decision_round=decision_round,
+        sim_t_s=sim_t_s,
+        spawn_events=SPAWN_EVENTS,
+        fires=fires,
+        edge_risk=edge_risk,
+    )
     if MESSAGING_ENABLED:
         # Deliver pending messages due for this round before asking any agent this round.
         # Waiting households participate too, so pre-departure prompts can read original peer chat.
@@ -4102,7 +4154,7 @@ def process_vehicles(step_idx: int):
                 else:
                     # LLM decision (Structured Outputs)
                     try:
-                        resp = client.responses.parse(
+                        resp = _openai_client().responses.parse(
                             model=OPENAI_MODEL,
                             input=[
                                 {"role": "system", "content": system_prompt},
@@ -4592,7 +4644,7 @@ def process_vehicles(step_idx: int):
                     )
                 else:
                     try:
-                        resp = client.responses.parse(
+                        resp = _openai_client().responses.parse(
                             model=OPENAI_MODEL,
                             input=[
                                 {"role": "system", "content": system_prompt},
@@ -4931,7 +4983,11 @@ try:
         _refresh_active_agent_live_status(sim_t, active_vehicle_ids)
         metrics.observe_active_vehicles(active_vehicle_ids, sim_t)
         # Early termination: stop when all agents arrived at their destination
-        if len(spawned) == len(SPAWN_EVENTS) and metrics.arrived_count() == len(SPAWN_EVENTS):
+        if (
+            not home_observation_exporter.enabled
+            and len(spawned) == len(SPAWN_EVENTS)
+            and metrics.arrived_count() == len(SPAWN_EVENTS)
+        ):
             print(f"[SIM] All {len(SPAWN_EVENTS)} agents arrived at destination by t={sim_t:.1f}s — ending early.")
             break
         delta_t = traci.simulation.getDeltaT()
@@ -4987,6 +5043,10 @@ finally:
         pass
     try:
         events.close()
+    except Exception:
+        pass
+    try:
+        home_observation_exporter.close()
     except Exception:
         pass
     try:
